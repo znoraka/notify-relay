@@ -6,6 +6,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -61,9 +62,27 @@ type relay struct {
 // coalesce into a single trailing send carrying the latest text + (+N more).
 type limiter struct {
 	last    time.Time
-	pending string
+	pending message
 	extra   int
 	timer   bool
+}
+
+// message is a formatted notification: text plus an optional Signal link
+// preview. Signal fetches no previews recipient-side, so the sender must
+// attach the card; preview is populated only when the payload carries the
+// metadata (currently the plandrop schema with an image).
+type message struct {
+	text    string
+	preview *preview
+}
+
+// preview is the raw card metadata. The thumbnail image is fetched lazily at
+// send time from image (a URL), keeping enqueue/coalesce cheap.
+type preview struct {
+	url         string
+	title       string
+	description string
+	image       string
 }
 
 const rlInterval = 30 * time.Second
@@ -94,17 +113,21 @@ func (r *relay) accountNumber() (string, error) {
 
 // send delivers to the sidecar with three retries and backoff, then gives up.
 // Message bodies are never logged — only source and status.
-func (r *relay) send(source, msg string) {
+func (r *relay) send(source string, msg message) {
 	number, err := r.accountNumber()
 	if err != nil {
 		log.Printf("send %s: account discovery: %v", source, err)
 		return
 	}
-	body, _ := json.Marshal(map[string]any{
-		"message":    msg,
+	payload := map[string]any{
+		"message":    msg.text,
 		"number":     number,
 		"recipients": []string{number},
-	})
+	}
+	if lp := r.linkPreview(source, msg.preview); lp != nil {
+		payload["link_preview"] = lp
+	}
+	body, _ := json.Marshal(payload)
 	client := &http.Client{Timeout: 15 * time.Second}
 	for attempt, wait := 0, time.Second; attempt < 3; attempt, wait = attempt+1, wait*3 {
 		resp, err := client.Post(r.signalURL+"/v2/send", "application/json", bytes.NewReader(body))
@@ -123,8 +146,54 @@ func (r *relay) send(source, msg string) {
 	log.Printf("send %s: giving up", source)
 }
 
+// linkPreview builds the sidecar's link_preview object, fetching and base64-
+// encoding the thumbnail. Returns nil when there's no preview or the image
+// can't be fetched — the send then degrades gracefully to plain text, which
+// still carries the URL in its body.
+func (r *relay) linkPreview(source string, p *preview) map[string]any {
+	if p == nil {
+		return nil
+	}
+	thumb, err := fetchThumbnail(p.image)
+	if err != nil {
+		log.Printf("send %s: preview image: %v (text-only)", source, err)
+		return nil
+	}
+	return map[string]any{
+		"url":              p.url,
+		"title":            p.title,
+		"description":      p.description,
+		"base64_thumbnail": thumb,
+	}
+}
+
+// fetchThumbnail downloads an image and returns its base64 encoding. Size is
+// capped so a misbehaving source can't balloon the send payload.
+func fetchThumbnail(url string) (string, error) {
+	if url == "" {
+		return "", fmt.Errorf("no image url")
+	}
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return "", fmt.Errorf("status %s", resp.Status)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 5<<20))
+	if err != nil {
+		return "", err
+	}
+	if len(data) == 0 {
+		return "", fmt.Errorf("empty image")
+	}
+	return base64.StdEncoding.EncodeToString(data), nil
+}
+
 // enqueue applies per-source rate limiting around send.
-func (r *relay) enqueue(source, msg string) {
+func (r *relay) enqueue(source string, msg message) {
 	r.rlMu.Lock()
 	l, ok := r.rl[source]
 	if !ok {
@@ -151,14 +220,14 @@ func (r *relay) flush(source string) {
 	r.rlMu.Lock()
 	l := r.rl[source]
 	msg, extra := l.pending, l.extra
-	l.pending, l.extra, l.timer = "", 0, false
+	l.pending, l.extra, l.timer = message{}, 0, false
 	l.last = time.Now()
 	r.rlMu.Unlock()
-	if msg == "" {
+	if msg.text == "" {
 		return
 	}
 	if extra > 1 {
-		msg += fmt.Sprintf(" (+%d more)", extra-1)
+		msg.text += fmt.Sprintf(" (+%d more)", extra-1)
 	}
 	go r.send(source, msg)
 }
@@ -166,17 +235,17 @@ func (r *relay) flush(source string) {
 // format turns an arbitrary JSON payload into a message. Permissive by
 // design: recognized shapes get nice formatting, anything else is delivered
 // best-effort rather than rejected.
-func format(body []byte) string {
+func format(body []byte) message {
 	var m map[string]any
 	if err := json.Unmarshal(body, &m); err != nil {
-		return truncate(strings.TrimSpace(string(body)), 500)
+		return message{text: truncate(strings.TrimSpace(string(body)), 500)}
 	}
 	str := func(k string) string { s, _ := m[k].(string); return s }
 
 	if msg := str("message"); msg != "" {
-		return msg
+		return message{text: msg}
 	}
-	// plandrop schema: {event, title, url, machine, ...}
+	// plandrop schema: {event, title, url, machine, image, description, ...}
 	if ev, title := str("event"), str("title"); ev != "" && title != "" {
 		emoji := map[string]string{"created": "📋", "updated": "✏️", "done": "✅"}[ev]
 		if emoji == "" {
@@ -190,21 +259,35 @@ func format(body []byte) string {
 		if mach := str("machine"); mach != "" {
 			s += " (" + mach + ")"
 		}
-		if url := str("url"); url != "" {
+		url := str("url")
+		if url != "" {
 			s += "\n" + url
 		}
 		if res := str("result"); res != "" && ev == "done" {
 			s += "\n→ " + res
 		}
-		return s
+		msg := message{text: s}
+		// Attach a link preview when the payload carries an image. Signal
+		// matches link_preview.url against a URL in the body, which is
+		// present above. Older senders omit image/description (omitempty),
+		// so this stays backward compatible: no image → plain text.
+		if url != "" && str("image") != "" {
+			msg.preview = &preview{
+				url:         url,
+				title:       title,
+				description: str("description"),
+				image:       str("image"),
+			}
+		}
+		return msg
 	}
 	// fallback: best-effort extraction of common fields
 	for _, k := range []string{"title", "text", "msg"} {
 		if v := str(k); v != "" {
-			return v
+			return message{text: v}
 		}
 	}
-	return truncate(strings.TrimSpace(string(body)), 500)
+	return message{text: truncate(strings.TrimSpace(string(body)), 500)}
 }
 
 func truncate(s string, n int) string {
@@ -241,11 +324,11 @@ func (r *relay) hook(w http.ResponseWriter, req *http.Request) {
 	}
 	body, _ := io.ReadAll(io.LimitReader(req.Body, 64<<10))
 	msg := format(body)
-	if msg == "" {
-		msg = "(empty notification)"
+	if msg.text == "" {
+		msg.text = "(empty notification)"
 	}
 	if src.Prefix != "" {
-		msg = src.Prefix + " " + msg
+		msg.text = src.Prefix + " " + msg.text
 	}
 	log.Printf("hook %s: accepted", source)
 	r.enqueue(source, msg)

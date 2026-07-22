@@ -17,8 +17,13 @@ The token may also be passed as `?token=...` for callers that can't set headers
 ## Payloads (permissive)
 
 - `{"message": "..."}` — sent as-is (with the source's prefix, if any)
-- plandrop schema `{event, title, url, machine, result}` — formatted with
-  📋 created / ✏️ updated / ✅ done
+- plandrop schema `{event, title, url, machine, result, image, description}` —
+  formatted with 📋 created / ✏️ updated / ✅ done. When `image` is present the
+  relay downloads it, base64-encodes it, and attaches a Signal link preview
+  (card with title + description + thumbnail) to the message — Signal fetches no
+  previews recipient-side, so the sender must supply them. If the image can't be
+  fetched, delivery falls back to plain text. `image`/`description` are
+  optional, so older senders keep working unchanged.
 - any other JSON — best-effort extraction of `title`/`text`/`msg`
 - non-JSON — delivered raw (truncated at 500 chars)
 
