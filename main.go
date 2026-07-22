@@ -281,6 +281,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/hook/", r.hook)
 	mux.HandleFunc("/healthz", r.healthz)
+	mux.HandleFunc("/livez", func(w http.ResponseWriter, _ *http.Request) { fmt.Fprintln(w, "ok") })
 	addr := envOr("LISTEN", ":8080")
 	log.Printf("notify-relay listening on %s, %d sources", addr, len(cfg.Sources))
 	log.Fatal(http.ListenAndServe(addr, mux))
