@@ -87,10 +87,15 @@ func loadT3Config() (*t3Config, string) {
 	}, ""
 }
 
-// parseAPNsKey accepts the .p8 Apple hands out. Coolify env vars can't hold real
-// newlines, so a single-line value with literal \n is also accepted.
+// parseAPNsKey accepts the .p8 Apple hands out. Env vars in a UI cannot hold
+// real newlines, so single-line forms are accepted too — and because whatever
+// stores the value may escape the backslash on the way in (Coolify does), both
+// \n and \\n are treated as line breaks. Getting this wrong yields a value that
+// looks perfectly correct in the dashboard and still refuses to parse.
 func parseAPNsKey(text string) (*ecdsa.PrivateKey, error) {
-	text = strings.ReplaceAll(strings.TrimSpace(text), `\n`, "\n")
+	text = strings.TrimSpace(text)
+	text = strings.ReplaceAll(text, `\\n`, "\n")
+	text = strings.ReplaceAll(text, `\n`, "\n")
 	block, _ := pem.Decode([]byte(text))
 	if block == nil {
 		return nil, fmt.Errorf("not PEM (expected -----BEGIN PRIVATE KEY-----)")

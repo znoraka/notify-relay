@@ -40,6 +40,13 @@ func TestParseAPNsKeyAcceptsEscapedNewlines(t *testing.T) {
 	if _, err := parseAPNsKey(escaped); err != nil {
 		t.Fatalf("escaped PEM should parse: %v", err)
 	}
+	// Coolify stores the value with the backslash escaped, so the container
+	// receives \\n. This looks identical in the dashboard and is the difference
+	// between a working relay and one that silently disables itself.
+	doubleEscaped := strings.ReplaceAll(strings.TrimSpace(pemText), "\n", `\\n`)
+	if _, err := parseAPNsKey(doubleEscaped); err != nil {
+		t.Fatalf("double-escaped PEM should parse: %v", err)
+	}
 	if _, err := parseAPNsKey(pemText); err != nil {
 		t.Fatalf("plain PEM should parse: %v", err)
 	}
