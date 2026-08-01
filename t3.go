@@ -193,6 +193,9 @@ func (s *t3Store) load() {
 		if state.Rows != nil {
 			s.rows = state.Rows
 		}
+		// A restart is a good moment to drop what can no longer be displayed,
+		// so a long-lived file does not carry months of finished threads.
+		s.pruneRowsLocked(time.Now())
 		log.Printf("t3: restored %d device(s), %d activity row(s)", len(s.devices), len(s.rows))
 		return
 	}
@@ -273,7 +276,21 @@ func (s *t3Store) putRow(key string, state t3State) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.rows[key] = state
+	s.pruneRowsLocked(time.Now())
 	s.save()
+}
+
+// pruneRowsLocked drops rows that can no longer appear on the card. Rows are
+// otherwise only removed when an environment publishes a tombstone, and an
+// environment that is simply switched off never does — linking one machine
+// replayed 242 threads, all but one of them long finished. Without this the
+// file grows forever and every publish re-serialises the lot.
+func (s *t3Store) pruneRowsLocked(now time.Time) {
+	for key, row := range s.rows {
+		if isExpired(row, now) || (isTerminalPhase(row.Phase) && !isRecentTerminal(row, now)) {
+			delete(s.rows, key)
+		}
+	}
 }
 
 func (s *t3Store) deleteRow(key string) {

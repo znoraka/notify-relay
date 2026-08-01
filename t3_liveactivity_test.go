@@ -254,3 +254,27 @@ func TestCardThrottleIsPerDevice(t *testing.T) {
 		t.Errorf("sends = %v, want one each", sends)
 	}
 }
+
+// TestPruneDropsUndisplayableRows: rows are only removed on a tombstone, and an
+// environment that is switched off never sends one. Linking one machine
+// replayed 242 threads, nearly all long finished — without pruning the state
+// file grows without bound and every publish re-serialises all of it.
+func TestPruneDropsUndisplayableRows(t *testing.T) {
+	r := newTestRelay(t)
+	r.store.putRow("env/live", stateAt("live", "running", time.Minute))
+	r.store.putRow("env/waiting", stateAt("waiting", "waiting_for_input", 3*time.Hour))
+	r.store.putRow("env/just-done", stateAt("just-done", "completed", time.Minute))
+	r.store.putRow("env/long-done", stateAt("long-done", "completed", 2*time.Hour))
+	r.store.putRow("env/abandoned", stateAt("abandoned", "running", 3*time.Hour))
+
+	kept := map[string]bool{}
+	for _, row := range r.store.rowList() {
+		kept[row.ThreadID] = true
+	}
+	if !kept["live"] || !kept["waiting"] || !kept["just-done"] {
+		t.Errorf("displayable rows were pruned: %v", kept)
+	}
+	if kept["long-done"] || kept["abandoned"] {
+		t.Errorf("undisplayable rows survived: %v", kept)
+	}
+}
