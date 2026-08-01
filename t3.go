@@ -20,8 +20,11 @@
 // from the token endpoint. Anyone holding those can push notifications to one
 // phone; that is the whole blast radius.
 //
-// Live Activities are stubbed (registration accepted, nothing sent) so the app
-// can call them without erroring. Alerts are the whole of v1.
+// Two channels ship from here. Alerts are selective — one notification per real
+// phase transition, gated on the device's per-event switches. Live Activities
+// are continuous: every publish redraws a lock-screen card showing all active
+// agents at once, which is why this file remembers the latest state per thread
+// rather than just forwarding the one it was handed (see t3_liveactivity.go).
 package main
 
 import (
@@ -125,16 +128,22 @@ type t3Prefs struct {
 }
 
 type t3Device struct {
-	DeviceID       string  `json:"deviceId"`
-	Label          string  `json:"label"`
-	Platform       string  `json:"platform"`
-	IosMajorVerion int     `json:"iosMajorVersion"`
-	AppVersion     string  `json:"appVersion,omitempty"`
-	BundleID       string  `json:"bundleId,omitempty"`
-	ApsEnvironment string  `json:"apsEnvironment,omitempty"`
-	PushToken      string  `json:"pushToken,omitempty"`
-	Prefs          t3Prefs `json:"preferences"`
-	UpdatedAt      string  `json:"updatedAt"`
+	DeviceID       string `json:"deviceId"`
+	Label          string `json:"label"`
+	Platform       string `json:"platform"`
+	IosMajorVerion int    `json:"iosMajorVersion"`
+	AppVersion     string `json:"appVersion,omitempty"`
+	BundleID       string `json:"bundleId,omitempty"`
+	ApsEnvironment string `json:"apsEnvironment,omitempty"`
+	PushToken      string `json:"pushToken,omitempty"`
+	// PushToStartToken starts a Live Activity on a device that has none
+	// running. iOS mints it up front, alongside the ordinary push token.
+	PushToStartToken string `json:"pushToStartToken,omitempty"`
+	// ActivityToken addresses one *running* Live Activity. iOS only mints it
+	// once a card exists, so the app registers it separately, after a start.
+	ActivityToken string  `json:"activityToken,omitempty"`
+	Prefs         t3Prefs `json:"preferences"`
+	UpdatedAt     string  `json:"updatedAt"`
 }
 
 type t3Store struct {
@@ -142,14 +151,30 @@ type t3Store struct {
 
 	mu      sync.Mutex
 	devices map[string]t3Device
+	// rows is the latest published state per "<environmentId>/<threadId>". An
+	// alert only needs the thread it is about; the Live Activity card shows
+	// every agent at once, so the relay has to remember them all.
+	rows map[string]t3State
 	// lastPhase records the phase most recently pushed per thread, so a burst of
 	// republishes (the environment re-publishes on every projection change, not
 	// only on phase changes) sends one notification per real transition.
 	lastPhase map[string]string
 }
 
+// persistedT3State is the on-disk shape. Devices were stored as a bare map
+// before Live Activities existed, so load falls back to that.
+type persistedT3State struct {
+	Devices map[string]t3Device `json:"devices"`
+	Rows    map[string]t3State  `json:"rows"`
+}
+
 func newT3Store(cfg *t3Config) *t3Store {
-	s := &t3Store{cfg: cfg, devices: map[string]t3Device{}, lastPhase: map[string]string{}}
+	s := &t3Store{
+		cfg:       cfg,
+		devices:   map[string]t3Device{},
+		rows:      map[string]t3State{},
+		lastPhase: map[string]string{},
+	}
 	s.load()
 	return s
 }
@@ -162,13 +187,24 @@ func (s *t3Store) load() {
 	if err != nil {
 		return
 	}
+	var state persistedT3State
+	if err := json.Unmarshal(b, &state); err == nil && state.Devices != nil {
+		s.devices = state.Devices
+		if state.Rows != nil {
+			s.rows = state.Rows
+		}
+		log.Printf("t3: restored %d device(s), %d activity row(s)", len(s.devices), len(s.rows))
+		return
+	}
+	// Pre-Live-Activity files held a bare device map. Read them so an upgrade
+	// does not silently drop a registration.
 	var devices map[string]t3Device
 	if err := json.Unmarshal(b, &devices); err != nil {
 		log.Printf("t3: state unreadable, starting empty: %v", err)
 		return
 	}
 	s.devices = devices
-	log.Printf("t3: restored %d device(s)", len(devices))
+	log.Printf("t3: restored %d device(s) from the legacy state format", len(devices))
 }
 
 // save persists via write-to-temp-then-rename so a crash mid-write cannot leave
@@ -178,7 +214,7 @@ func (s *t3Store) save() {
 		log.Printf("t3: state dir: %v", err)
 		return
 	}
-	b, err := json.MarshalIndent(s.devices, "", "  ")
+	b, err := json.MarshalIndent(persistedT3State{Devices: s.devices, Rows: s.rows}, "", "  ")
 	if err != nil {
 		return
 	}
@@ -204,6 +240,60 @@ func (s *t3Store) remove(deviceID string) {
 	defer s.mu.Unlock()
 	delete(s.devices, deviceID)
 	s.save()
+}
+
+// setActivityToken records the token for a newly started Live Activity. The
+// registration can arrive before the device is known if the app registers out
+// of order, so an unknown device is ignored rather than invented.
+func (s *t3Store) setActivityToken(deviceID, token string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	device, ok := s.devices[deviceID]
+	if !ok {
+		return
+	}
+	device.ActivityToken = token
+	s.devices[deviceID] = device
+	s.save()
+}
+
+func (s *t3Store) clearActivityToken(deviceID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	device, ok := s.devices[deviceID]
+	if !ok || device.ActivityToken == "" {
+		return
+	}
+	device.ActivityToken = ""
+	s.devices[deviceID] = device
+	s.save()
+}
+
+func (s *t3Store) putRow(key string, state t3State) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rows[key] = state
+	s.save()
+}
+
+func (s *t3Store) deleteRow(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.rows[key]; !ok {
+		return
+	}
+	delete(s.rows, key)
+	s.save()
+}
+
+func (s *t3Store) rowList() []t3State {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]t3State, 0, len(s.rows))
+	for _, row := range s.rows {
+		out = append(out, row)
+	}
+	return out
 }
 
 func (s *t3Store) list() []t3Device {
@@ -335,13 +425,41 @@ type apnsResult struct {
 	gone bool
 }
 
+// apnsRequest is one push. Alerts and Live Activities differ only in the token
+// they address, the topic suffix, and the push type — everything else about
+// talking to Apple is shared.
+type apnsRequest struct {
+	device   t3Device
+	token    string
+	payload  map[string]any
+	pushType string
+	topic    string
+	priority string
+}
+
+// sendAPNs pushes an ordinary alert to the device's push token.
 func (r *t3Relay) sendAPNs(device t3Device, payload map[string]any) apnsResult {
+	return r.sendAPNsRequest(apnsRequest{
+		device:   device,
+		token:    device.PushToken,
+		payload:  payload,
+		pushType: "alert",
+		topic:    r.cfg.topicFor(device),
+		priority: "10",
+	})
+}
+
+func (r *t3Relay) sendAPNsRequest(input apnsRequest) apnsResult {
+	device := input.device
+	if input.token == "" {
+		return apnsResult{reason: "no_token"}
+	}
 	bearer, err := r.auth.bearer(r.cfg)
 	if err != nil {
 		log.Printf("t3: apns token: %v", err)
 		return apnsResult{reason: "provider_token"}
 	}
-	body, err := json.Marshal(payload)
+	body, err := json.Marshal(input.payload)
 	if err != nil {
 		return apnsResult{reason: "encode"}
 	}
@@ -359,16 +477,14 @@ func (r *t3Relay) sendAPNs(device t3Device, payload map[string]any) apnsResult {
 	if sandbox {
 		host = "api.sandbox.push.apple.com"
 	}
-	topic := r.cfg.topicFor(device)
-
-	req, err := http.NewRequest(http.MethodPost, "https://"+host+"/3/device/"+device.PushToken, strings.NewReader(string(body)))
+	req, err := http.NewRequest(http.MethodPost, "https://"+host+"/3/device/"+input.token, strings.NewReader(string(body)))
 	if err != nil {
 		return apnsResult{reason: "request"}
 	}
 	req.Header.Set("authorization", "bearer "+bearer)
-	req.Header.Set("apns-topic", topic)
-	req.Header.Set("apns-push-type", "alert")
-	req.Header.Set("apns-priority", "10")
+	req.Header.Set("apns-topic", input.topic)
+	req.Header.Set("apns-push-type", input.pushType)
+	req.Header.Set("apns-priority", input.priority)
 	req.Header.Set("content-type", "application/json")
 
 	resp, err := apnsClient.Do(req)
@@ -480,6 +596,13 @@ func (r *t3Relay) devices(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 		in.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+		// The app re-registers on every launch and foreground, and its payload
+		// has no activity token — that is registered separately when a card
+		// starts. Carry the existing one over, or a relaunch would orphan the
+		// running Live Activity and it could never be updated or ended.
+		if previous, ok := r.store.get(in.DeviceID); ok && in.ActivityToken == "" {
+			in.ActivityToken = previous.ActivityToken
+		}
 		r.store.put(in)
 		log.Printf("t3: registered device %s (%s), push token %s, notifications=%v",
 			in.DeviceID, in.Label, presence(in.PushToken), in.Prefs.NotificationsEnabled)
@@ -501,28 +624,51 @@ func presence(s string) string {
 	return "present"
 }
 
-// liveActivities accepts registrations so the app's toggle does not error, but
-// v1 sends no Live Activity pushes. The app treats a successful registration as
-// "armed", so leaving this on will show a card that never updates — keep the
-// Live Activity Updates switch off until v2 implements the pushes.
+// liveActivities records the push token for a Live Activity the app has just
+// started. Until this arrives the relay can only start a card (via the device's
+// push-to-start token); afterwards it can update and end that specific one.
 func (r *t3Relay) liveActivities(w http.ResponseWriter, req *http.Request) {
 	if !clientAuthed(req) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
-	io.Copy(io.Discard, io.LimitReader(req.Body, 64<<10))
-	log.Printf("t3: live activity registration accepted (not implemented in v1)")
+	var in struct {
+		DeviceID          string `json:"deviceId"`
+		ActivityPushToken string `json:"activityPushToken"`
+	}
+	if err := json.NewDecoder(io.LimitReader(req.Body, 64<<10)).Decode(&in); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+	if in.DeviceID == "" || in.ActivityPushToken == "" {
+		http.Error(w, "deviceId and activityPushToken required", http.StatusBadRequest)
+		return
+	}
+	r.store.setActivityToken(in.DeviceID, in.ActivityPushToken)
+	log.Printf("t3: live activity token registered for %s", in.DeviceID)
+
+	// The app arms a card expecting it to reflect current work. Painting it
+	// immediately avoids an empty card sitting there until the next publish,
+	// which on a quiet day could be hours.
+	if agg := buildAggregate(r.store.rowList(), time.Now()); agg != nil {
+		if device, ok := r.store.get(in.DeviceID); ok && device.Prefs.LiveActivitiesEnabled {
+			r.sendLiveActivity(device, in.ActivityPushToken, "update", agg, nil)
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 // agentActivitySnapshot lets the app decide whether arming a Live Activity is
-// worthwhile. v1 never has an aggregate, so it always says "nothing running".
+// worthwhile before creating one — no empty lock-screen card when nothing is
+// running — and seed it with real content instead of a placeholder.
 func (r *t3Relay) agentActivitySnapshot(w http.ResponseWriter, req *http.Request) {
 	if !clientAuthed(req) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"aggregate": nil})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"aggregate": buildAggregate(r.store.rowList(), time.Now()),
+	})
 }
 
 func (r *t3Relay) listEnvironments(w http.ResponseWriter, req *http.Request) {
@@ -686,10 +832,15 @@ func (r *t3Relay) publish(w http.ResponseWriter, req *http.Request) {
 	// notify again if it comes back. The ids come from the path here, since
 	// there is no state body to read them from.
 	if in.State == nil {
+		deliveries := []map[string]any{}
 		if key, ok := publishThreadKey(req.URL.Path); ok {
 			r.store.forgetThread(key)
+			// The thread also leaves the card. With nothing left to show,
+			// syncLiveActivities ends it rather than leaving a stale list.
+			r.store.deleteRow(key)
+			deliveries = r.syncLiveActivities(buildAggregate(r.store.rowList(), time.Now()), nil)
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "deliveries": []any{}})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "deliveries": deliveries})
 		return
 	}
 
@@ -699,20 +850,52 @@ func (r *t3Relay) publish(w http.ResponseWriter, req *http.Request) {
 
 func (r *t3Relay) deliver(state t3State) []map[string]any {
 	deliveries := []map[string]any{}
-
 	threadKey := state.EnvironmentID + "/" + state.ThreadID
-	if !r.store.shouldPush(threadKey, state.Phase) {
-		return deliveries
+
+	// The card tracks every publish, not just phase transitions: a thread whose
+	// title or model changed still has to redraw. Alerts are the selective
+	// channel; the Live Activity is the continuous one.
+	r.store.putRow(threadKey, state)
+
+	alerting := r.shouldAlert(threadKey, state)
+	if alerting {
+		deliveries = append(deliveries, r.deliverAlerts(state, threadKey)...)
 	}
-	// Done/Failed for a thread that settled a while ago is a replay, not news.
+
+	// An alerting update wakes the screen for the card too, but only for the
+	// phases that mean a human is being waited on — a completion should not
+	// buzz twice.
+	var cardAlert *liveActivityAlert
+	if alerting && (state.Phase == "waiting_for_approval" || state.Phase == "waiting_for_input") {
+		cardAlert = &liveActivityAlert{
+			title: truncateSummary(state.ThreadTitle),
+			body:  truncateSummary(statusForPhase(state.Phase) + ": " + state.ProjectTitle),
+		}
+	}
+	deliveries = append(deliveries,
+		r.syncLiveActivities(buildAggregate(r.store.rowList(), time.Now()), cardAlert)...)
+	return deliveries
+}
+
+// shouldAlert applies the rules that keep the notification channel quiet: one
+// alert per real phase transition, and nothing for a terminal state that is
+// merely being replayed after a reconnect.
+func (r *t3Relay) shouldAlert(threadKey string, state t3State) bool {
+	if !r.store.shouldPush(threadKey, state.Phase) {
+		return false
+	}
 	if state.Phase == "completed" || state.Phase == "failed" {
 		if at, err := time.Parse(time.RFC3339, state.UpdatedAt); err == nil {
 			if time.Since(at) > terminalFreshness {
-				return deliveries
+				return false
 			}
 		}
 	}
+	return true
+}
 
+func (r *t3Relay) deliverAlerts(state t3State, threadKey string) []map[string]any {
+	deliveries := []map[string]any{}
 	title := truncateSummary(state.ThreadTitle)
 	body := truncateSummary(statusForPhase(state.Phase) + ": " + state.ProjectTitle)
 
@@ -841,4 +1024,11 @@ func registerT3Routes(mux *http.ServeMux) bool {
 	}
 	log.Printf("t3 relay enabled: topic %s, APNs %s, state %s", cfg.bundleID, env, cfg.statePath)
 	return true
+}
+
+func (s *t3Store) get(deviceID string) (t3Device, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	device, ok := s.devices[deviceID]
+	return device, ok
 }

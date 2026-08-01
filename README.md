@@ -111,9 +111,30 @@ ignored, and there is no Clerk. Auth is `T3_ENV_CREDENTIAL` for publishing plus
 any non-empty bearer for the app. Holding either lets someone push a
 notification to one phone — that is the entire blast radius.
 
+### Live Activities
+
+Both channels ship. **Alerts** are selective: one notification per real phase
+transition, gated on the device's per-event switches, and terminal states older
+than two minutes are treated as replays rather than news.
+
+**Live Activities** are continuous. The relay keeps the latest published state
+per thread and folds them into one aggregate — up to five rows on the lock
+screen, three in the expanded Dynamic Island. Every publish redraws the card;
+routine redraws go out at APNs priority 5, while a thread newly needing a human
+sends an alerting update at priority 10 so the screen wakes.
+
+Rows expire so a machine that dies mid-run cannot inflate the count forever:
+two hours for running work, twenty-four for a thread waiting on a human, and a
+finished thread keeps its Done/Failed row for fifteen minutes before dropping
+out. When nothing is left the card is ended rather than left showing an empty
+list.
+
+A card is started via the device's push-to-start token and thereafter addressed
+by the per-activity token the app registers at `/v1/mobile/live-activities`.
+That token is preserved across re-registration — the app re-registers on every
+launch with a payload that does not include it.
+
 ### Not implemented
 
-Live Activities register successfully but no updates are ever pushed, so leave
-**Live Activity Updates** off in the app until that lands. `/v1/environments`
-always returns an empty list: environments are linked by writing to their secret
-store directly, so the relay never learns about them.
+`/v1/environments` always returns an empty list: environments are linked by
+writing to their secret store directly, so the relay never learns about them.
