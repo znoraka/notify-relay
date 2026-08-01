@@ -228,6 +228,30 @@ func TestDeviceRegistrationRoundTrip(t *testing.T) {
 	}
 }
 
+// TestConfiguredTopicWinsOverClientReport pins the behaviour that a wrong
+// client-reported bundle id cannot break delivery. An OTA config exported for
+// the wrong variant does exactly that, and the only symptom is a
+// TopicDisallowed buried in a delivery result.
+func TestConfiguredTopicWinsOverClientReport(t *testing.T) {
+	r := newTestRelay(t)
+	if r.cfg.bundleID != "dev.example.app" {
+		t.Fatalf("unexpected configured topic %q", r.cfg.bundleID)
+	}
+	cases := map[string]string{
+		// A device claiming the production variant while the relay is configured
+		// for preview is the exact failure this guards against.
+		"dev.example.app.wrong": "dev.example.app",
+		"":                      "dev.example.app",
+		"dev.example.app":       "dev.example.app",
+	}
+	for reported, want := range cases {
+		got := r.cfg.topicFor(t3Device{DeviceID: "dev-1", BundleID: reported})
+		if got != want {
+			t.Errorf("topicFor(reported %q) = %q, want %q", reported, got, want)
+		}
+	}
+}
+
 func TestMobileRoutesRequireAuthorization(t *testing.T) {
 	r := newTestRelay(t)
 	req := httptest.NewRequest(http.MethodPost, "/v1/mobile/devices", strings.NewReader(`{}`))

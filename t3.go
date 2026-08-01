@@ -311,6 +311,21 @@ func b64url(b []byte) string { return base64.RawURLEncoding.EncodeToString(b) }
 // ALPN for https, which is all APNs requires.
 var apnsClient = &http.Client{Timeout: 15 * time.Second}
 
+// topicFor picks the APNs topic. The configured bundle id wins over the one the
+// app reported: this relay serves exactly one app, and a client can report the
+// wrong bundle through no fault of its own — an OTA config exported for the
+// wrong variant makes the app announce dev.ezag.t3code while the installed
+// binary is dev.ezag.t3code.preview, and APNs answers TopicDisallowed. Trusting
+// the deployment's own configuration makes that whole class of mismatch
+// harmless, at the cost of not supporting two variants against one relay.
+func (cfg *t3Config) topicFor(device t3Device) string {
+	if device.BundleID != "" && device.BundleID != cfg.bundleID {
+		log.Printf("t3: device %s reported bundle %q; using configured %q",
+			device.DeviceID, device.BundleID, cfg.bundleID)
+	}
+	return cfg.bundleID
+}
+
 type apnsResult struct {
 	ok     bool
 	status int
@@ -344,10 +359,7 @@ func (r *t3Relay) sendAPNs(device t3Device, payload map[string]any) apnsResult {
 	if sandbox {
 		host = "api.sandbox.push.apple.com"
 	}
-	topic := device.BundleID
-	if topic == "" {
-		topic = r.cfg.bundleID
-	}
+	topic := r.cfg.topicFor(device)
 
 	req, err := http.NewRequest(http.MethodPost, "https://"+host+"/3/device/"+device.PushToken, strings.NewReader(string(body)))
 	if err != nil {
