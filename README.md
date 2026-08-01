@@ -53,3 +53,51 @@ is auto-discovered from the sidecar's `/v1/accounts`.
   send with `(+N more)`.
 - Message bodies are never logged at info level — only source + status.
 - `GET /healthz` pings the sidecar.
+
+## T3 Code relay (optional)
+
+The same binary also serves a minimal [T3 Code](https://github.com/pingdotgg/t3code)
+relay, so the phone app's **Device Notifications** switch works against
+self-hosted infrastructure instead of the hosted Cloudflare relay. It is
+entirely separate from the Signal half above and shares nothing but the port.
+
+Enabled only when all of these are set — otherwise the T3 routes are skipped and
+the service stays a plain webhook-to-Signal relay:
+
+```sh
+APNS_TEAM_ID=...          # Apple developer team
+APNS_KEY_ID=...           # Key ID of the .p8
+APNS_PRIVATE_KEY=...      # .p8 contents; literal \n allowed for one-line env vars
+APNS_BUNDLE_ID=...        # default APNs topic, e.g. dev.ezag.t3code.preview
+APNS_ENVIRONMENT=production   # or sandbox for development-signed builds
+T3_ENV_CREDENTIAL=...     # shared secret the environment presents when publishing
+T3_STATE=/var/lib/notify-relay/t3-devices.json   # needs a persistent volume
+```
+
+Routes: `/health`, `/.well-known/oauth-*`, `/v1/client/dpop-token`,
+`/v1/client/devices`, `/v1/environments`, `/v1/mobile/*`, and
+`/v1/environments/{env}/threads/{thread}/agent-activity`.
+
+Point an environment at it by writing the credentials into its secret store:
+
+```sh
+curl -X POST https://<environment>/api/connect/relay-config \
+  -H "Authorization: Bearer $ENVIRONMENT_TOKEN" -H 'content-type: application/json' \
+  -d '{"relayUrl":"https://notify.gawaak.ovh","cloudUserId":"local",
+       "environmentCredential":"'"$T3_ENV_CREDENTIAL"'","cloudMintPublicKey":"unused"}'
+```
+
+### Security model
+
+Single user, so the hosted relay's defences are deliberately absent: DPoP proofs
+are accepted without verification, the environment's signed publish proof is
+ignored, and there is no Clerk. Auth is `T3_ENV_CREDENTIAL` for publishing plus
+any non-empty bearer for the app. Holding either lets someone push a
+notification to one phone — that is the entire blast radius.
+
+### Not implemented
+
+Live Activities register successfully but no updates are ever pushed, so leave
+**Live Activity Updates** off in the app until that lands. `/v1/environments`
+always returns an empty list: environments are linked by writing to their secret
+store directly, so the relay never learns about them.

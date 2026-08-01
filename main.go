@@ -365,6 +365,9 @@ func main() {
 	mux.HandleFunc("/hook/", r.hook)
 	mux.HandleFunc("/healthz", r.healthz)
 	mux.HandleFunc("/livez", func(w http.ResponseWriter, _ *http.Request) { fmt.Fprintln(w, "ok") })
+	// The T3 Code relay (t3.go) mounts its own routes when APNs is configured;
+	// without those env vars this stays a plain webhook-to-Signal relay.
+	registerT3Routes(mux)
 	addr := envOr("LISTEN", ":8080")
 	log.Printf("notify-relay listening on %s, %d sources", addr, len(cfg.Sources))
 	log.Fatal(http.ListenAndServe(addr, mux))
