@@ -517,10 +517,26 @@ type t3Relay struct {
 	cfg   *t3Config
 	store *t3Store
 	auth  *apnsAuth
+	// cards collapses bursts of routine card redraws per device.
+	cards *cardThrottle
 }
 
 func newT3Relay(cfg *t3Config) *t3Relay {
-	return &t3Relay{cfg: cfg, store: newT3Store(cfg), auth: &apnsAuth{}}
+	r := &t3Relay{cfg: cfg, store: newT3Store(cfg), auth: &apnsAuth{}}
+	// The trailing send looks the device up again: it may have re-registered,
+	// or lost its activity token, between the burst and the flush.
+	r.cards = newCardThrottle(cardCoalesceWindow, func(deviceID string, agg *t3Aggregate) apnsResult {
+		device, ok := r.store.get(deviceID)
+		if !ok || device.ActivityToken == "" || !device.Prefs.LiveActivitiesEnabled {
+			return apnsResult{reason: "no_activity"}
+		}
+		res := r.sendLiveActivity(device, device.ActivityToken, "update", agg, nil)
+		if res.gone {
+			r.store.clearActivityToken(deviceID)
+		}
+		return res
+	})
+	return r
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
@@ -834,6 +850,7 @@ func (r *t3Relay) publish(w http.ResponseWriter, req *http.Request) {
 	if in.State == nil {
 		deliveries := []map[string]any{}
 		if key, ok := publishThreadKey(req.URL.Path); ok {
+			log.Printf("t3: publish %s tombstone", key)
 			r.store.forgetThread(key)
 			// The thread also leaves the card. With nothing left to show,
 			// syncLiveActivities ends it rather than leaving a stale list.
@@ -858,6 +875,12 @@ func (r *t3Relay) deliver(state t3State) []map[string]any {
 	r.store.putRow(threadKey, state)
 
 	alerting := r.shouldAlert(threadKey, state)
+	// Log every publish, including the ones that produce nothing. A publish that
+	// arrives and delivers nothing is the normal case (a deduped republish) and
+	// also the failure case (no device, no token) — without a line here the two
+	// are indistinguishable from outside, and "is anything even arriving?"
+	// becomes an archaeology exercise.
+	log.Printf("t3: publish %s phase=%s alert=%v", threadKey, state.Phase, alerting)
 	if alerting {
 		deliveries = append(deliveries, r.deliverAlerts(state, threadKey)...)
 	}

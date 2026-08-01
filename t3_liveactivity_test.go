@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"sync"
 	"testing"
 	"time"
 )
@@ -164,5 +165,92 @@ func TestStoreRowsSurviveRestart(t *testing.T) {
 	}
 	if len(restored.list()) != 1 {
 		t.Errorf("devices lost across restart: %d", len(restored.list()))
+	}
+}
+
+func TestCardThrottleSendsFirstThenCoalesces(t *testing.T) {
+	var mu sync.Mutex
+	var sent []*t3Aggregate
+	throttle := newCardThrottle(50*time.Millisecond, func(_ string, agg *t3Aggregate) apnsResult {
+		mu.Lock()
+		sent = append(sent, agg)
+		mu.Unlock()
+		return apnsResult{ok: true}
+	})
+
+	first := &t3Aggregate{ActiveCount: 1}
+	if _, queued := throttle.submit("dev-1", first); queued {
+		t.Fatal("the first update should go out immediately")
+	}
+
+	// A burst inside the window must not each become a push.
+	for i := 2; i <= 5; i++ {
+		if _, queued := throttle.submit("dev-1", &t3Aggregate{ActiveCount: i}); !queued {
+			t.Fatalf("update %d should have been coalesced", i)
+		}
+	}
+
+	mu.Lock()
+	count := len(sent)
+	mu.Unlock()
+	if count != 1 {
+		t.Fatalf("sent %d pushes during the burst, want 1", count)
+	}
+
+	// The trailing send carries the newest state, not an intermediate one.
+	time.Sleep(120 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(sent) != 2 {
+		t.Fatalf("sent %d pushes total, want 2 (one immediate, one trailing)", len(sent))
+	}
+	if sent[1].ActiveCount != 5 {
+		t.Errorf("trailing send carried activeCount %d, want the newest (5)", sent[1].ActiveCount)
+	}
+}
+
+// TestCardThrottleResetDropsPending: an alerting update or a start has just
+// gone out, so a queued routine redraw is both stale and redundant.
+func TestCardThrottleResetDropsPending(t *testing.T) {
+	var mu sync.Mutex
+	sends := 0
+	throttle := newCardThrottle(50*time.Millisecond, func(_ string, _ *t3Aggregate) apnsResult {
+		mu.Lock()
+		sends++
+		mu.Unlock()
+		return apnsResult{ok: true}
+	})
+
+	throttle.submit("dev-1", &t3Aggregate{ActiveCount: 1}) // immediate
+	throttle.submit("dev-1", &t3Aggregate{ActiveCount: 2}) // queued
+	throttle.reset("dev-1")
+
+	time.Sleep(120 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	if sends != 1 {
+		t.Errorf("sends = %d, want 1 — reset should have dropped the queued redraw", sends)
+	}
+}
+
+func TestCardThrottleIsPerDevice(t *testing.T) {
+	var mu sync.Mutex
+	sends := map[string]int{}
+	throttle := newCardThrottle(time.Minute, func(deviceID string, _ *t3Aggregate) apnsResult {
+		mu.Lock()
+		sends[deviceID]++
+		mu.Unlock()
+		return apnsResult{ok: true}
+	})
+
+	// One device's burst must not starve another device's first update.
+	throttle.submit("dev-1", &t3Aggregate{})
+	throttle.submit("dev-1", &t3Aggregate{})
+	throttle.submit("dev-2", &t3Aggregate{})
+
+	mu.Lock()
+	defer mu.Unlock()
+	if sends["dev-1"] != 1 || sends["dev-2"] != 1 {
+		t.Errorf("sends = %v, want one each", sends)
 	}
 }

@@ -18,6 +18,7 @@ import (
 	"log"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -227,6 +228,88 @@ type liveActivityAlert struct {
 	body  string
 }
 
+// cardCoalesceWindow bounds how often one device's card is redrawn. An
+// environment republishes on every projection change, so a single agent working
+// can emit updates several times a second; the card cannot render that fast and
+// the update budget is finite. Alerting updates, starts and ends bypass this —
+// only routine redraws are worth delaying.
+const cardCoalesceWindow = 2 * time.Second
+
+// cardThrottle collapses a burst of redraws per device into one trailing send
+// carrying the newest aggregate, mirroring how the Signal half rate-limits.
+type cardThrottle struct {
+	window time.Duration
+	send   func(deviceID string, agg *t3Aggregate) apnsResult
+
+	mu    sync.Mutex
+	state map[string]*cardThrottleEntry
+}
+
+type cardThrottleEntry struct {
+	last    time.Time
+	pending *t3Aggregate
+	armed   bool
+}
+
+func newCardThrottle(window time.Duration, send func(string, *t3Aggregate) apnsResult) *cardThrottle {
+	return &cardThrottle{window: window, send: send, state: map[string]*cardThrottleEntry{}}
+}
+
+// submit either sends immediately, returning the result, or holds the
+// aggregate for a trailing send and reports it as queued.
+func (t *cardThrottle) submit(deviceID string, agg *t3Aggregate) (res apnsResult, queued bool) {
+	t.mu.Lock()
+	entry, ok := t.state[deviceID]
+	if !ok {
+		entry = &cardThrottleEntry{}
+		t.state[deviceID] = entry
+	}
+	if time.Since(entry.last) >= t.window {
+		entry.last = time.Now()
+		t.mu.Unlock()
+		return t.send(deviceID, agg), false
+	}
+	// Only the newest aggregate matters; an intermediate one the card never
+	// rendered is not worth sending afterwards.
+	entry.pending = agg
+	if !entry.armed {
+		entry.armed = true
+		delay := t.window - time.Since(entry.last)
+		time.AfterFunc(delay, func() { t.flush(deviceID) })
+	}
+	t.mu.Unlock()
+	return apnsResult{}, true
+}
+
+func (t *cardThrottle) flush(deviceID string) {
+	t.mu.Lock()
+	entry, ok := t.state[deviceID]
+	if !ok {
+		t.mu.Unlock()
+		return
+	}
+	agg := entry.pending
+	entry.pending, entry.armed, entry.last = nil, false, time.Now()
+	t.mu.Unlock()
+	if agg != nil {
+		t.send(deviceID, agg)
+	}
+}
+
+// reset drops any pending redraw and restarts the window. Used when something
+// more important than a redraw has just gone out, so the coalesced update is
+// both stale and redundant.
+func (t *cardThrottle) reset(deviceID string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	entry, ok := t.state[deviceID]
+	if !ok {
+		t.state[deviceID] = &cardThrottleEntry{last: time.Now()}
+		return
+	}
+	entry.pending, entry.armed, entry.last = nil, false, time.Now()
+}
+
 // sendLiveActivity pushes one card event. event is start, update or end.
 // A start goes to the device's push-to-start token; update and end go to the
 // token the app registered for the running activity.
@@ -307,6 +390,23 @@ func (r *t3Relay) syncLiveActivities(agg *t3Aggregate, alert *liveActivityAlert)
 			deliveries = append(deliveries, liveActivityDelivery(device.DeviceID, "live_activity_end", res))
 
 		case device.ActivityToken != "":
+			// An alerting update wakes the screen, so it must not wait behind a
+			// coalescing window; a routine redraw can.
+			if alert == nil {
+				res, queued := r.cards.submit(device.DeviceID, agg)
+				if queued {
+					deliveries = append(deliveries, map[string]any{
+						"deviceId": device.DeviceID, "kind": "live_activity_update",
+						"ok": true, "queued": true,
+						"apnsStatus": nil, "apnsReason": nil, "apnsId": nil,
+					})
+					continue
+				}
+				deliveries = append(deliveries,
+					liveActivityDelivery(device.DeviceID, "live_activity_update", res))
+				continue
+			}
+			r.cards.reset(device.DeviceID)
 			res := r.sendLiveActivity(device, device.ActivityToken, "update", agg, alert)
 			if res.gone {
 				r.store.clearActivityToken(device.DeviceID)
@@ -314,6 +414,7 @@ func (r *t3Relay) syncLiveActivities(agg *t3Aggregate, alert *liveActivityAlert)
 			deliveries = append(deliveries, liveActivityDelivery(device.DeviceID, "live_activity_update", res))
 
 		case device.PushToStartToken != "":
+			r.cards.reset(device.DeviceID)
 			res := r.sendLiveActivity(device, device.PushToStartToken, "start", agg, nil)
 			deliveries = append(deliveries, liveActivityDelivery(device.DeviceID, "live_activity_start", res))
 		}
