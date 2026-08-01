@@ -81,10 +81,26 @@ Routes: `/health`, `/.well-known/oauth-*`, `/v1/client/dpop-token`,
 Point an environment at it by writing the credentials into its secret store:
 
 ```sh
-curl -X POST https://<environment>/api/connect/relay-config \
-  -H "Authorization: Bearer $ENVIRONMENT_TOKEN" -H 'content-type: application/json' \
+# The environment token comes from the environment itself; `t3 connect` needs
+# Clerk and is unavailable on a Clerk-less build.
+TOKEN=$(t3 auth session issue --token-only | grep . | tail -1)
+
+# cloudMintPublicKey is validated as a real Ed25519 key even though this relay
+# never mints credentials, so generate a throwaway pair once:
+#   openssl genpkey -algorithm ed25519 -out mint.key
+#   openssl pkey -in mint.key -pubout -out mint.pub
+MINT=$(awk 'BEGIN{ORS="\\n"} {print}' mint.pub)
+
+curl -X POST http://127.0.0.1:3773/api/connect/relay-config \
+  -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
   -d '{"relayUrl":"https://notify.gawaak.ovh","cloudUserId":"local",
-       "environmentCredential":"'"$T3_ENV_CREDENTIAL"'","cloudMintPublicKey":"unused"}'
+       "environmentCredential":"'"$T3_ENV_CREDENTIAL"'","cloudMintPublicKey":"'"$MINT"'",
+       "endpointRuntime":null}'
+
+# Publishing is off until switched on:
+curl -X POST http://127.0.0.1:3773/api/connect/preferences \
+  -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"publishAgentActivity":true}'
 ```
 
 ### Security model
